@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import glob
+from shutil import which
+
+history = ".history"
+master = ".master"
+tmp_patch = "tmp.patch"
+changelog = "changelog.txt"
+ignorefile = ".ignore"
+ignoretmp = ".ignoretmp"
+ignore = [master, history, ignorefile, ignoretmp]
+
+def clearFiles(filelist):
+    for item in filelist:
+        if os.path.isfile(item):
+            try:
+                os.remove(item)
+            except OSError as error:
+                print("[x] Error cannot delete file %s : %s" % (item, error))
+    for item in filelist:
+        if os.path.isdir(item):
+            try:
+                os.rmdir(item)
+            except OSError as error:
+                print("[x] Error cannot delete directory %s : %s" % (item, error))
+
+def appendChangelog(sha1sum, message):
+    print("[v] Append %s to changelog" % sha1sum)
+    with open(history+"/"+changelog, 'a') as f:
+        f.write("%s %s\n" % (sha1sum, message))
+
+def touch(fname, times=None):
+    with open(fname, 'a'):
+        os.utime(fname, times)
+
+def checkChangelog():
+    if not os.path.isfile(history+"/"+changelog):
+        print("[i] Changelog is empty (new repository)")
+        return
+    print("[.] Checking Changelog...")
+    errors = 0
+    all_commits = []
+    with open(history+"/"+changelog) as f:
+        for line in f:
+            (sha1file, comment) = line.split(maxsplit=1)
+            if not os.path.isfile(sha1file):
+                print("[.] Warning: Commit %s cannot be found (%s)" % (sha1file, comment))
+                errors += 1
+            else:
+                all_commits.append(sha1file)
+    all_patches = glob.glob(history+"/"+"*.patch")
+    for patch in all_patches:
+        if not patch in all_commits:
+            print("[.] Warning: Patch %s is not referenced by any commit" % patch)
+            errors += 1
+    if errors == 0:
+        print("[v] Changelog Ok")
+
+def checkDependencies():
+    """Check whether `name` is on PATH and marked as executable."""
+    # from whichcraft import which
+    if which("diff") is None:
+        print("[x] Please install diff (difftools)")
+        exit(1)
+    elif which("patch") is None:
+        print("[x] Please install patch")
+        exit(1)
+
+def sha1sum(filename):
+    import hashlib
+    BUF_SIZE = 65536
+    sha1 = hashlib.sha1()
+    with open(filename, 'rb') as f:
+        while True:
+            data = f.read(BUF_SIZE)
+            if not data:
+                break
+            sha1.update(data)
+    return sha1.hexdigest()
+
+def compute_status_diff(verbose, dcmp):
+    status_diff = 0
+    for name in dcmp.diff_files:
+        status_diff += 1
+        if verbose:
+            print("Differences in : %s" % name)
+    for name in dcmp.left_only:
+        status_diff += 1
+        if verbose:
+            print("Deleted : %s" % name)
+    for name in dcmp.right_only:
+        status_diff += 1
+        if verbose:
+            print("New file : %s" % name)
+    for sub_dcmp in dcmp.subdirs.values():
+        status_diff += compute_status_diff(verbose, sub_dcmp)
+    return status_diff
+def checkStatus(verbose=False):
+    from filecmp import dircmp
+    dcmp = dircmp(master, "./", ignore=ignore)
+    status_diff = compute_status_diff(verbose, dcmp)
+    if verbose:
+        print(" - %d Diffs" % status_diff)
+    return status_diff
+
+root = os.path.abspath(".") # Absolute path of the current directory
+tmp_patch_path = history+"/"+tmp_patch
+
+if len(sys.argv) == 2 and sys.argv[1] == "init":
+    if not os.path.isdir(history) and not os.path.isdir(master):
+        try:
+            os.mkdir(history)
+            os.mkdir(master)
+        except OSError as error:
+            print("[x] Error while creating directories: %s" % error)
+        exit(0)
+    else:
+        print("[x] Error: %s/ and/or %s/ exist" % (history, master))
+        exit(1)
+
+elif len(sys.argv) > 2 and sys.argv[1] == "commit":
+    checkDependencies()
+
+    if not os.path.isdir(history) or not os.path.isdir(master):
+        print("[x] Error: the directory does not contain %s/ or %s/" % (history, master))
+        exit(1)
+
+    checkChangelog()
+
+    for i in range(2, len(sys.argv)):
+        print(" - Checking %s ..." % sys.argv[i])
+        list = glob.glob(sys.argv[i])
+
+        for relative_new_file in list:
+            if not os.path.exists(relative_new_file):
+                print("[x] Error: %s does not exist" % relative_new_file)
+                exit(1)
+
+            abspath = os.path.abspath(relative_new_file)
+            if not abspath.startswith(root):
+                print("[x] Error: %s is outside of the repository" % relative_new_file)
+                exit(1)
+
+            # Make sure relative_new_file is relative
+            if abspath != root:
+                relative_new_file = abspath[len(root)+1:]
+            else:
+                relative_new_file = "."
+
+            if relative_new_file == history:
+                print("[i] Ignoring %s" % history)
+                continue
+            if relative_new_file == master:
+                print("[i] Ignoring %s" % master)
+                continue
+
+            is_dir = os.path.isdir(relative_new_file)
+            is_file = os.path.isfile(relative_new_file)
+
+            if not is_dir and not is_file:
+                print("[x] Error %s is not a directory nor a file, only directories and files are supported" % relative_new_file)
+                exit(1)
+
+            may_need_to_clean=[]
+            relative_master_file=master+"/"+relative_new_file
+            if is_dir and not os.path.exists(relative_master_file):
+                print(" - Creating directory %s" % (relative_master_file))
+                try:
+                    os.makedirs(relative_master_file)
+                    may_need_to_clean.append(relative_master_file)
+                except OSError as error:
+                    print("[x] Error while creating directories: %s" % error)
+            if is_file and not os.path.exists(relative_master_file):
+                dirname = os.path.dirname(relative_master_file)
+                print(" - Creating directory %s" % (dirname))
+                try:
+                    os.makedirs(dirname, exist_ok=True)
+                    may_need_to_clean.append(dirname)
+                except OSError as error:
+                    print("[x] Error while creating directories: %s" % error)
+                print(" - Creating empty file %s" % (relative_master_file))
+                try:
+                    touch(relative_master_file)
+                    may_need_to_clean.append(relative_master_file)
+                except OSError as error:
+                    print("[x] Error while creating empty file: %s" % error)
+
+            #print('diff -uprN --exclude="%s" --exclude="%s" "%s" "%s" > "%s"' % (history, master, relative_master_file, relative_new_file, tmp_patch_path))
+            status = os.system('diff -uprN --exclude="%s" --exclude="%s" "%s" "%s" > "%s"' % (history, master, relative_master_file, relative_new_file, tmp_patch_path))
+            #print("[i] Diff returned %d" % status)
+            if status == 0:
+                print("[v] No changes")
+                os.remove(tmp_patch_path)
+                clearFiles(may_need_to_clean)
+                continue
+            elif status == 1:
+                print("[x] Error while get diff")
+                os.remove(tmp_patch_path)
+                clearFiles(may_need_to_clean)
+                exit(1)
+
+            if not (which("batcat") is None):
+                os.system('batcat %s' % tmp_patch_path)
+            else:
+                os.system('less %s' % tmp_patch_path)
+            verif = input("Are you sure you want to commit this file/directory ? [yes]  ")
+            if verif != "yes":
+                print("[i] Abording %s... Moving on..." % relative_new_file)
+                os.remove(tmp_patch_path)
+                clearFiles(may_need_to_clean)
+                continue
+
+            status = os.system('patch -E -s -d "%s" -p0 < %s' % (master, tmp_patch_path))
+            #print("[i] Patch returned %d" % status)
+            if status == 0:
+                print("[v] Changes made succesfully on master")
+            else:
+                print("[x] Error while updating master")
+                os.remove(tmp_patch_path)
+                clearFiles(may_need_to_clean)
+
+            sha1 = sha1sum(tmp_patch_path)
+            patch_final_name = history+"/"+sha1+".patch"
+            print("[v] Saving patch as: %s" % patch_final_name)
+            os.rename(tmp_patch_path, patch_final_name)
+
+            tag = input("Commit's tag: ")
+
+            appendChangelog(patch_final_name, tag)
+
+elif len(sys.argv) == 2 and sys.argv[1] == "discard":
+    checkDependencies()
+
+    if not os.path.isdir(history) or not os.path.isdir(master):
+        print("[x] Error: the directory does not contain %s/ or %s/" % (history, master))
+        exit(1)
+
+    checkChangelog()
+
+    pattern = root+"/*"
+    verif = input("You are going to delete all content in %s, are you sure ? [yes]  " % pattern)
+    if not verif == "yes":
+        exit(0)
+
+    import shutil
+    from distutils.dir_util import copy_tree
+    for CleanUp in glob.glob(pattern):
+        if not CleanUp in ignore:
+            print("[i] Removing %s" % CleanUp)
+            if os.path.isfile(CleanUp):
+                os.remove(CleanUp)
+            else:
+                shutil.rmtree(CleanUp, ignore_errors=True)
+    print("[.] Fetching master...")
+    copy_tree(master, root)
+    print("[v] Master is restored")
+
+elif len(sys.argv) == 3 and sys.argv[1] == "revert":
+    checkDependencies()
+
+    if not os.path.isdir(history) or not os.path.isdir(master):
+        print("[x] Error: the directory does not contain %s/ or %s/" % (history, master))
+        exit(1)
+
+    checkChangelog()
+    st_diff = checkStatus()
+    if st_diff != 0:
+        print("[x] Error: Your working copy do not match master, commit or discard first, see 'status' for more information")
+        exit(1)
+
+    list_of_commits = []
+    with open(history+"/"+changelog) as f:
+        for line in f:
+            (sha1file, comment) = line.split(maxsplit=1)
+            list_of_commits.append(sha1file)
+
+    if not sys.argv[2] in list_of_commits:
+        print("[x] Error %s do not match any commit, see 'log' for more information" % sys.argv[2])
+        exit(1)
+
+    list_of_commits=list_of_commits[::-1]
+    commits_to_revert = []
+    for commit in list_of_commits:
+        commits_to_revert.append(commit)
+        if sys.argv[2] == commit:
+            break
+    verif = input("Do you really want to revert %d commits ? [yes]  " % len(commits_to_revert))
+
+    if verif != "yes":
+        exit(0)
+
+    count = 0
+    for commit in commits_to_revert:
+        count += 1
+        print("[.] Revert patch %d / %d" % (count, len(commits_to_revert)))
+        status = os.system('patch -E -s -f -R -p0 < %s' % commit)
+        #print("[i] Patch returned %d" % status)
+        if status == 0:
+            print("[v] Patched successfully")
+        else:
+            print("[X] Error while applying patch")
+            print("[i] Note: Use 'discard' to go back to your previous state")
+            exit(1)
+
+# TODO: Experimental: branch
+
+# TODO: Experimental: merge commit together: combinediff (from patchtutils)
+
+elif len(sys.argv) == 2 and sys.argv[1] == "status":
+    checkDependencies()
+
+    if not os.path.isdir(history) or not os.path.isdir(master):
+        print("[x] Error: the directory does not contain %s/ or %s/" % (history, master))
+        exit(1)
+
+    checkChangelog()
+    checkStatus(verbose=True)
+
+elif len(sys.argv) == 2 and sys.argv[1] == "log":
+    checkDependencies()
+
+    if not os.path.isdir(history) or not os.path.isdir(master):
+        print("[x] Error: the directory does not contain %s/ or %s/" % (history, master))
+        exit(1)
+
+    checkChangelog()
+    with open(history+"/"+changelog) as f:
+        for line in f:
+            (sha1file, comment) = line.split(maxsplit=1)
+            print("%s | %s" % (sha1file, comment), end="")
+        print("               ^--- latest")
+
+else:
+    print("Commands are:")
+    print(" - init                                           : Create a repository in the current directory")
+    print(" - log                                            : Print the history")
+    print(" - commit <File/Directory> [<File/Directory> ...] : Commit the changes made to these files/directories, use directories to group commits together")
+    print(" - discard                                        : Discard the current changes on the work directory and go back to the last commited change (aka master)")
+    print(" - status                                         : List the differences between the work directory and master")
+    print(" - revert <Commit's patch file>                   : Revert the work directory to a commit (listed by 'log')")
+    print()
+    print("Uses:")
+    print("This program helps you keep track of your changes made on text files.")
+    print("It is meant to be simple and stores previous version of your work in clear .patch files")
+    print(">  When 'init' is used it creates hiden directories (%s %s)" % (master, history))
+    print(">  %s contains the last version you commited (called master)" % master)
+    print(">  %s contains the patches you can revert to if you are not happy with your master" % history)
+    print(">  Once you modified one or many files you can 'commit' then to the master (you will be")
+    print(">  prompt to review the changes and asked for confirmation).")
+    print(">  If you no longer want your local changes you can 'discard' them.")
+    print(">  You can use 'log' to list all the commits and the tags (description) you gave them")
